@@ -22,7 +22,7 @@ completed input $\tilde{x} = (x_S, X_{\bar S})$ and averaged over the
 out-of-coalition features,
 
 $$
-v(S, x) = \mathbb{E}_{X_{\bar S}}\big[\, h\big(X = (x_S, X_{\bar S})\big) \big].
+v(S, x) = \mathbb{E}_{X_{\bar S}}\big[ h\big(X = (x_S, X_{\bar S})\big) \big].
 $$
 
 By efficiency, the Shapley values of each game decompose the gap between the
@@ -58,23 +58,23 @@ Run the steps in order from `notebooks/`. Caches under `results/` and `models/` 
 re-runs cheap; runtimes below are for cold first runs on one TITAN RTX with 24 CPU
 workers (App. E). Set `QUICK_RUN=1` for a short test run with separate output folders.
 
-- 🎯 **Figure 1** — *Synthetic Gaussian DGP (§5.1).*
+- 🎯 **Figure 1:** *Synthetic Gaussian DGP (§5.1).*
   Run `notebooks/1_synthetic_dgp.ipynb` top-to-bottom (~2 min).
 
-- 🚲 **Figure 2 + Figs D.2 / D.3** — *Bike Sharing NGBoost (§5.2 + App. D.2.1).*
+- 🚲 **Figure 2 + Figs D.2 / D.3:** *Bike Sharing NGBoost (§5.2 + App. D.2.1).*
   Run `notebooks/2_bikesharing_ngboost.ipynb` (~10 min).
 
-- 🤖 **Prerequisite** — *DeepAR pre-training (used by Figures 3b and D.4).*
+- 🤖 **Prerequisite:** *DeepAR pre-training (used by Figures 3b and D.4).*
   Run `python 3_train_deepar.py` (<1 min if stored models are used; ~2 h retraining three likelihoods).
   → `models/deepar_{normal,studentt,lognormal}.ckpt`
 
-- 🧪 **Figure 3a** — *Semi-synthetic benchmark (§5.3 + App. D.3.2).*
+- 🧪 **Figure 3a:** *Semi-synthetic benchmark (§5.3 + App. D.3.2).*
   Run `python 4_semisynthetic.py` (~40 min, CPU only).
 
-- 📊 **Figure 3b** — *DeepAR vs. Chronos main comparison (§5.3).*
+- 📊 **Figure 3b:** *DeepAR vs. Chronos main comparison (§5.3).*
   Run `python 5_main_comparison.py` (~34 h; about 120 GB of RAM and 123 GB of disk for the trajectory caches). [Chronos-T5](https://huggingface.co/amazon/chronos-t5-base) is loaded from Hugging Face on first call.
 
-- 🔬 **Figure D.4** — *DeepAR estimator validation (App. D.3.3).*
+- 🔬 **Figure D.4:** *DeepAR estimator validation (App. D.3.3).*
   Run `python 6_deepar_validation.py` (CPU-bound: ~24.5 h with `N_JOBS=200` on a 128-core server, about 6 days with 24 workers).
 
 The result tables behind Figures 3a, 3b and D.4 are included, so `python make_figures.py`
@@ -84,10 +84,10 @@ The core library lives in `entropy_shapley/`, including the hierarchy games (`ga
 
 ## 📚 Datasets
 
-* [**UCI Bike Sharing**](https://doi.org/10.24432/C5W894) (Fanaee-T, 2013) — hourly rentals; aggregated into
+* [**UCI Bike Sharing**](https://doi.org/10.24432/C5W894) (Fanaee-T, 2013): hourly rentals; aggregated into
   $T = 8$ two-hour blocks over 06:00–22:00. CC BY 4.0.
 * [**UCI Electricity Load Diagrams 2011–2014**](https://doi.org/10.24432/C58C86) (Trindade, 2015; Xiong, 2024
-  preprocessed snapshot from the package `gluonts`) — hourly load per series; aggregated into $T = 12$ two-hour blocks per day, restricted to the first 100 series.
+  preprocessed snapshot from the package `gluonts`): hourly load per series; aggregated into $T = 12$ two-hour blocks per day, restricted to the first 100 series.
   CC BY 4.0.
 
 Both files are bundled in `datasets/` for offline reproducibility.
