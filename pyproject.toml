@@ -23,9 +23,6 @@ dependencies = [
     "lightgbm>=4.6.0",
 ]
 
-[tool.setuptools]
-packages = ["entropy_shapley"]
-
 [tool.uv]
 override-dependencies = [
     "numpy>=2.0",
@@ -37,17 +34,3 @@ override-dependencies = [
     # import-time check. Pin it inside the transformers-compatible range.
     "huggingface-hub>=0.34,<1.0",
 ]
-
-
-[tool.uv.sources]
-torch = [
-    { index = "pytorch-cu124" },
-]
-torchvision = [
-    { index = "pytorch-cu124" },
-]
-
-[[tool.uv.index]]
-name = "pytorch-cu124"
-url = "https://download.pytorch.org/whl/cu124"
-explicit = true

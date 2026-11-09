@@ -4,20 +4,35 @@ __pycache__/
 lightning_logs/
 *.tmp
 .DS_Store
-.venv/
+.venv
 .uv-cache/
 
-paper_draft.pdf
-plots/*
-plan.md
-SUMMARY.md
+# Results: the large caches (about 115 GB) stay local; the small tables behind
+# the figures and the text are part of the repository.
 results/*
-moldels/*
-old/*
+!results/5_3/
+results/5_3/*
+!results/5_3/cross_share_main.csv
+!results/5_3/forecast_metrics_main.csv
+!results/5_3/summary_table_main.csv
+!results/5_3/summary_table_main.tex
+!results/5_3/runtime.csv
+!results/5_3/reference_diagnostics_chronos_base_analytical.json
+!results/5_3/semisynthetic/
+results/5_3/semisynthetic/*
+!results/5_3/semisynthetic/*.csv
+!results/D_3/
+results/D_3/*
+!results/D_3/*.csv
 
-# Regenerable trajectory / sample caches (5.3 + 5.4)
-# These are reproduced deterministically by re-running the corresponding
-# notebook; checkpoint hashes in *_meta.json validate the cache on reload.
-results/53/*/samples_seed*.npy
-results/53/*/raw_seed*.npy
-results/54/trajectories_*.npy
+# Figures of the paper and the additional outputs (PDF; PNG only for the README)
+plots/*
+!plots/paper/
+!plots/extra/
+plots/**/*.png
+!plots/paper/synthetic_hierarchy.png
+!plots/paper/bikesharing_hierarchy.png
+
+# Quick runs (QUICK_RUN=1)
+results_quick/
+plots_quick/

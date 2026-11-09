@@ -1,19 +1,20 @@
 #######################################################################################
-#                   DeepAR training on UCI Electricity dataset
+#              DeepAR training on the UCI Electricity dataset (App. D.3.1)
 #
-# This script trains three DeepAR models on the UCI Electricity dataset, one per 
-# supported likelihood (Gaussian, Student-t, LogNormal). The trained checkpoints are
-# saved to disk and used by the main comparison script (4_main_comparison.py) and
-# the DeepAR validation script (5_deepar_validation.py).
+# This script trains three DeepAR models on the UCI Electricity dataset, one per
+# likelihood (Gaussian, Student-t, LogNormal). The checkpoints are stored in models/
+# and used by the model comparison (5_main_comparison.py) and the DeepAR validation
+# (6_deepar_validation.py):
 #
-#   * Normal       -> models/deepar_normal.ckpt (used by Section 5.3 main)
-#   * Student-t    -> models/deepar_studentt.ckpt (used by Appendix D.3.1)
-#   * Log-Normal   -> models/deepar_lognormal.ckpt (used by Appendix D.3.1)
+#   * Normal       -> models/deepar_normal.ckpt     (Sec. 5.3, Fig. 3b; App. D.3.3)
+#   * Student-t    -> models/deepar_studentt.ckpt   (App. D.3.3, Fig. D.4)
+#   * Log-Normal   -> models/deepar_lognormal.ckpt  (App. D.3.3, Fig. D.4)
 #
-# By default, the script checks for existing checkpoints and skips training if they 
-# are found; set RETRAIN = True to force re-training. A single GPU is sufficient, 
-# and training all three models takes around two hours on an RTX 6000 Ada (50 epochs,
-# batch size 256, 100 series). 
+# The checkpoints of the paper are part of the repository, so by default the script
+# only loads them and checks their forecasts against a last-value baseline (extra
+# output: plots/extra/fig_train_forecasts.pdf). Set RETRAIN = True to train again;
+# this takes around two hours on one RTX 6000 Ada (50 epochs, batch size 256,
+# 100 series).
 #######################################################################################
 
 # ─────────────────────────────────────────────────────────────────────────────────────
@@ -21,10 +22,13 @@
 # ─────────────────────────────────────────────────────────────────────────────────────
 import sys, os, warnings, logging, time
 start_time = time.time()
-sys.path.insert(0, os.path.join(os.path.abspath(""), ".."))
+from pathlib import Path
 
-# Set the CUDA device
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0") # adjust if you have multiple GPUs and want to use a different one
+# Resolve imports from the script location. Run from notebooks/ for the
+# ../datasets, ../models, ../results and ../plots paths.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+# Choose the GPU with CUDA_VISIBLE_DEVICES; PyTorch uses the first visible device.
 
 import pytorch_forecasting
 import torch
@@ -36,17 +40,9 @@ from pytorch_forecasting import DeepAR, Baseline
 from pytorch_forecasting.metrics import NormalDistributionLoss
 from torchmetrics.functional.regression import continuous_ranked_probability_score as crps_fn
 
-# Bugfix for PyTorch 2.6+ to ensure DeepAR checkpoints load correctly.
-import functools
-_orig = torch.load
-@functools.wraps(_orig)
-def _patched(*args, **kwargs):
-    kwargs.setdefault("weights_only", False)
-    return _orig(*args, **kwargs)
-torch.load = _patched
-
-from entropy_shapley.losses import StudentTDistributionLoss, LogNormalDistributionLoss
-from entropy_shapley.utils_datasets import build_long_dataframe, build_datasets
+from experiments.electricity.deepar_losses import StudentTDistributionLoss, LogNormalDistributionLoss
+from experiments.electricity.data import build_long_dataframe, build_datasets
+from experiments.electricity.forecasting import load_deepar
 
 # Suppress warnings and reduce logging verbosity for cleaner output.
 warnings.filterwarnings('ignore')
@@ -61,7 +57,7 @@ print(f"torch={torch.__version__} | lightning={pl.__version__} | pf={pytorch_for
 # ── Setup ────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────────────
 print("─" * 60)
-print("⚙️  DeepAR training setup")
+print("DeepAR training setup")
 print("─" * 60)
 
 
@@ -83,7 +79,7 @@ DROP_SERIES       = {"182"}                          # contains mostly zeros
 # Set paths and checkpoint dir
 DATA_PATH         = "../datasets/electricity.csv"   # notebook-relative default
 MODEL_DIR         = "../models"
-PLOT_DIR          = "../plots/5_3"
+PLOT_DIR          = "../plots/extra"
 os.makedirs(PLOT_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
@@ -101,7 +97,7 @@ print(f"Retraining: '{RETRAIN}'\n")
 # ── Data preprocessing ───────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────────────
 print("─" * 60)
-print("📊  Data preprocessing (electricity dataset)")
+print("Data preprocessing (Electricity dataset)")
 print("─" * 60)
 
 df_long = build_long_dataframe(
@@ -136,7 +132,7 @@ for name, ds in [("Training", training), ("Validation", validation), ("Test", te
 # ── Baseline sanity check ────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────────────
 print("\n" + "─" * 60)
-print("📏  Baseline sanity check (last-value persistence)")
+print("Baseline check (last-value persistence)")
 print("─" * 60)
 
 baseline = Baseline()
@@ -152,7 +148,7 @@ print(f"MAE (last-value baseline): {mae_baseline:.4f}")
 # ── Train or load DeepAR models ──────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────────────
 print("\n" + "─" * 60)
-print("🤖  Train/load DeepAR models (Gaussian, Student-t, LogNormal)")
+print("Train or load DeepAR models (Gaussian, Student-t, LogNormal)")
 print("─" * 60 + "\n")
 
 DISTRIBUTIONS = {
@@ -164,9 +160,8 @@ DISTRIBUTIONS = {
 # Helper function to train or load the DeepAR models
 def train_or_load(label, LossCls, ckpt_path):
     if os.path.exists(ckpt_path) and not RETRAIN:
-        print(f"✓ {label}: cached → {ckpt_path}")
-        map_location = None if torch.cuda.is_available() else "cpu"
-        return DeepAR.load_from_checkpoint(ckpt_path, map_location=map_location)
+        print(f"{label}: loaded {ckpt_path}")
+        return load_deepar(ckpt_path)
     print(f"──── {label}: training {EPOCHS} epochs")
     early_stop = EarlyStopping(monitor="val_loss", min_delta=1e-4, patience=5, mode="min")
     ckpt_dir   = os.path.dirname(ckpt_path)
@@ -186,9 +181,8 @@ def train_or_load(label, LossCls, ckpt_path):
         optimizer="Adam", loss=LossCls(),
     )
     trainer.fit(model, train_dataloaders=train_dl, val_dataloaders=val_dl)
-    print(f"✓ {label}: saved → {ckpt_path}\n")
-    map_location = None if torch.cuda.is_available() else "cpu"
-    return DeepAR.load_from_checkpoint(ckpt_path, map_location=map_location)
+    print(f"{label}: saved to {ckpt_path}\n")
+    return load_deepar(ckpt_path)
 
 # Train or load models for each distribution and store in a dict.
 models = {label: train_or_load(label, *args) for label, args in DISTRIBUTIONS.items()}
@@ -203,7 +197,7 @@ models = {label: train_or_load(label, *args) for label, args in DISTRIBUTIONS.it
 # = exp(μ+σ²/2) ≫ exp(μ) = median). The median makes MAE comparable across
 # Normal / Student-t / LogNormal.
 print("\n" + "─" * 60)
-print("📏  Evaluate forecasts (MAE of sample median, CRPS over samples)")
+print("Evaluate forecasts (MAE of the sample median, CRPS over samples)")
 print("─" * 60)
 
 N_SAMPLES = 200   # ensemble size — 200+ is enough for stable CRPS estimates
@@ -211,7 +205,7 @@ N_SAMPLES = 200   # ensemble size — 200+ is enough for stable CRPS estimates
 print(f"Sampling {N_SAMPLES} forecasts per series from each model...")
 print(f"  baseline (last-value, point prediction): MAE = CRPS = {mae_baseline:.4f}\n")
 
-forecast_cache = {}    # store samples for the next cell (forecast plots)
+forecast_cache = {}
 for label, model in models.items():
     model.eval()
     preds = model.predict(
@@ -240,7 +234,7 @@ for label, model in models.items():
 # ── Visualize forecasts: context + predictive distributions ──────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────────────
 print("\n" + "─" * 60)
-print("📈  Visualize forecasts: context + predictive distributions")
+print("Visualize forecasts: context and predictive distributions (extra)")
 print("─" * 60)
 
 QUANTILES_TO_PLOT = [0.025, 0.10, 0.50, 0.90, 0.975]
@@ -258,7 +252,7 @@ for x, _ in test_dl:
 encoder_target_all = torch.cat(encoder_targets, dim=0).numpy()    # (B, CONTEXT)
 context_show = min(CONTEXT_SHOW, encoder_target_all.shape[1])
 
-# Pick 3 validation series spanning low / median / high target magnitude.
+# Pick 3 test series spanning low / median / high target magnitude.
 y_targets = forecast_cache[next(iter(forecast_cache))]["target"]    # (B, T)
 sort_idx = np.argsort(y_targets.mean(axis=1))
 plot_indices = [
@@ -313,7 +307,7 @@ fig.suptitle("Predictive distributions per DeepAR likelihood — context + forec
              fontsize=10, y=1.02)
 
 fig.savefig(PLOT_DIR + "/fig_train_forecasts.pdf", bbox_inches="tight")
-print("✓ saved → " + PLOT_DIR + "/fig_train_forecasts.pdf")
+print("saved to " + PLOT_DIR + "/fig_train_forecasts.pdf")
 plt.show()
 
 
@@ -321,6 +315,6 @@ plt.show()
 # ── Wrap up ──────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────────────
 print("\n" + "─" * 60)
-print("✅  Done with DeepAR training and evaluation")
+print("Done with DeepAR training and evaluation")
 print(f"Total runtime: {(time.time() - start_time) / 60:.1f} minutes")
 print("─" * 60)

@@ -1,50 +1,33 @@
-"""
-Sample-based entropy estimators for Section 5.3.2 (Estimator Validation).
-
-All four estimators inherit from `SampleImputer`, a model-agnostic base that
-takes a `predict_fn(X) -> (samples, raw)` callable. `raw` may be None for
-models that do not expose distributional parameters (e.g. zero-shot
-foundation models like Chronos); only `MixtureCopulaImputer` requires it.
-
-Estimators
-----------
-MVNSampleImputer
-    Empirical: fit multivariate normal to sample trajectories, apply
-    closed-form Gaussian entropy formulas. Biased when marginals are
-    heavy-tailed or skewed, i.e, mismatched to the true distribution.
-
-KDECopulaImputer
-    Marginals: Gaussian-KDE with leave-one-out entropy.
-    Dependence: Gaussian copula on PIT-transformed samples.
-    The fully model-agnostic pipeline used in Section 5.3.3.
-
-MixtureCopulaImputer
-    Marginals: analytical mixture entropy from raw distribution parameters
-                (reuses the same logsumexp construction as imputer.py).
-    Dependence: Gaussian copula on PIT-transformed samples.
-    Validation-only — isolates the copula approximation error.
-    Requires `raw` parameters from the predict_fn.
-
-KNNImputer
-    Kozachenko-Leonenko nonparametric estimator.
-    L1 via univariate KL per horizon, L3 via multivariate KL on (M, T)
-    samples, L2 via chain-rule differences L3_{1:t} - L3_{1:t-1}.
-    Degrades in high T due to curse of dimensionality.
-
-All four estimators share the same (L1, L2, L3) API defined by the base
-class HierarchyImputer. Internal per-row computation is cached across the
-three _compute_* calls to avoid threefold recomputation inside a chunk.
-"""
-
+# =============================================================================
+#                           Entropy Estimators
+#
+# Sample-based estimators for marginal, sequential conditional, and joint
+# predictive entropies (Levels 1-3) of multivariate outputs (Sec. 4.2.3).
+#
+# Four estimation approaches are implemented:
+#   - MVNSampleImputer:     PG, multivariate Gaussian approximation using the
+#                           empirical covariance matrix.
+#   - KDECopulaImputer:     GC-KDE, KDE marginals combined with a Gaussian
+#                           copula (App. C.3).
+#   - KNNImputer:           kNN, non-parametric Kozachenko-Leonenko estimation.
+#   - MixtureCopulaImputer: GC-Param, model-based mixture marginals combined
+#                           with a Gaussian copula (validation only, App. D.3.3).
+#
+# All estimators inherit from SampleImputer and operate on predictive
+# trajectories of shape (n, M, T), returning entropy estimates for all
+# three levels (n = number of instances/coalitions, M = number of predictive
+# samples, i.e., N in the paper, T = number of output dimensions).
+# =============================================================================
 from __future__ import annotations
 from typing import Tuple
 
 import numpy as np
 from joblib import Parallel, delayed
-from scipy.stats import norm, gaussian_kde, lognorm
+from scipy.stats import norm, gaussian_kde
 from scipy.stats import t as student_t
-from scipy.special import digamma, gammaln, logsumexp, expit
-from scipy.spatial import cKDTree
+from scipy.special import digamma, gammaln, logsumexp, expit, ndtr
+from scipy.spatial import KDTree
+import warnings
 
 from .imputer import HierarchyImputer
 
@@ -54,7 +37,7 @@ from .imputer import HierarchyImputer
 # =============================================================================
 
 class SampleImputer(HierarchyImputer):
-    """Hierarchy imputer for sample-based entropy estimators.
+    """Hierarchy imputer for sample-based entropy estimators (Sec. 4.2.3).
 
     Decouples sample generation from entropy estimation: pass any callable
     ``predict_fn(X) -> (samples, raw)`` that produces trajectories from
@@ -63,9 +46,8 @@ class SampleImputer(HierarchyImputer):
     like Chronos); only ``MixtureCopulaImputer`` requires it.
 
     Subclasses implement ``_compute_all((samples, raw)) -> (L1, L2, L3)``.
-    The triple is cached per ``id(samples)`` so that ``_process_chunk``'s
-    three calls to ``_compute_L{1,2,3}`` share work (KDE fit, PIT,
-    correlation, Cholesky).
+    The entropy estimates are cached for the most recent sample batch,
+    using array identity to avoid redundant computations.
 
     Parameters
     ----------
@@ -78,8 +60,11 @@ class SampleImputer(HierarchyImputer):
     def __init__(self, predict_fn, *args, **kwargs):
         super().__init__(model=None, *args, **kwargs)
         self._predict_fn = predict_fn
-        self._cache_id: int | None = None
-        self._cache_triple: tuple | None = None
+
+        # Cache entropy estimates for the most recent sample batch
+        self._cache_samples = None
+        self._cache_raw = None
+        self._cache_triple = None
 
     def _predict(self, X: np.ndarray):
         if self._predict_fn is None:
@@ -93,11 +78,18 @@ class SampleImputer(HierarchyImputer):
         raise NotImplementedError
 
     def _get_cached(self, dist):
-        samples = dist[0] if isinstance(dist, tuple) else dist
-        dist_id = id(samples)
-        if dist_id != self._cache_id:
-            self._cache_id = dist_id
+        samples, raw = dist if isinstance(dist, tuple) else (dist, None)
+
+        # Recompute only when the sample batch or raw parameters change
+        if (
+            self._cache_triple is None
+            or samples is not self._cache_samples
+            or raw is not self._cache_raw
+        ):
             self._cache_triple = self._compute_all(dist)
+            self._cache_samples = samples
+            self._cache_raw = raw
+
         return self._cache_triple
 
     def _compute_L1(self, dist):
@@ -111,328 +103,511 @@ class SampleImputer(HierarchyImputer):
 
 
 # =============================================================================
-#       Section 4.2.3 — "Parametric Gaussian estimation" 
+#                Parametric Gaussian Estimator (PG, MVN)
+#
+# This estimator uses outcome samples to fit a multivariate normal distribution
+# and computes the entropy using the closed-form formula for Gaussian
+# distributions.
 # =============================================================================
 
 class MVNSampleImputer(SampleImputer):
-    """Fit MVN to sample trajectories; use closed-form Gaussian entropy.
+    """PG (Sec. 4.2.3): fit an MVN to the trajectories, use closed-form Gaussian entropies.
 
-    Approximates both marginals and dependence as Gaussian. Strawman that
-    shows why the Gaussian-copula approach is needed: when the true
-    marginals are heavy-tailed (StudentT) or skewed (LogNormal), the
-    Gaussian moment-match is biased, and the bias compounds in the L3
-    determinant.
+    Approximates both marginals and dependence as Gaussian.
 
-    Uses the same analytical formulas as GaussianImputer in imputer.py
-    but with Sigma replaced by the empirical sample covariance.
+    Uses the same formulas as GaussianImputer in imputer.py (Eqs. 10-12),
+    with Sigma replaced by the sample covariance Sigma_hat(x~).
     """
-
-    def __init__(self, *args, ridge: float = 1e-8, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._ridge = ridge
 
     def _compute_all(self, dist):
         samples = dist[0] if isinstance(dist, tuple) else dist  # (n, M, T)
+        samples = np.asarray(samples, dtype=np.float64)
+        # Samples: n instance/coalition combinations, M predictive samples, T output dimensions
         n, M, T = samples.shape
 
-        eye_T = self._ridge * np.eye(T)
+        if M <= T:
+            raise ValueError(
+                f"Need M > T for full-rank sample covariance, got M={M}, T={T}."
+            )
+        if not np.all(np.isfinite(samples)):
+            raise ValueError("Samples must contain only finite values.")
+
+        # Estimate empirical covariance matrices (batched over n distributions)
+        centered = samples - samples.mean(axis=1, keepdims=True)       # (n, M, T)
+        Sigma = (centered.transpose(0, 2, 1) @ centered) / (M - 1)     # (n, T, T)
+        Sigma = 0.5 * (Sigma + Sigma.transpose(0, 2, 1))               # Ensure symmetry
+
+        # Extract marginal variances and Cholesky diagonal
+        diag_var = np.diagonal(Sigma, axis1=-2, axis2=-1)             # (n, T)
+        chol = np.linalg.cholesky(Sigma)                              # Sigma = L @ L.T
+        log_diag_L = np.log(np.diagonal(chol, axis1=-2, axis2=-1))    # (n, T)
+
         half_log_2pie = 0.5 * np.log(2 * np.pi * np.e)
 
-        # Vectorised over the n=(c × n_inst × n_coal) rows. Build all sample-
-        # covariance matrices at once (batched gemm) and use numpy's batched
-        # Cholesky (LAPACK potrf). At a 12 800-row sweep this is ~2.5× faster
-        # than the per-row loop variant.
-        centered = samples - samples.mean(axis=1, keepdims=True)              # (n, M, T)
-        Sigma    = (centered.transpose(0, 2, 1) @ centered) / (M - 1)         # (n, T, T)
-        Sigma    = Sigma + eye_T                                              # broadcast ridge
-        Sigma    = 0.5 * (Sigma + Sigma.transpose(0, 2, 1))                   # numerical symmetrise
-        diag_var = np.diagonal(Sigma, axis1=-2, axis2=-1)                     # (n, T)
+        # Level 1: Marginal entropies
+        # H(Y_t) = 0.5 * log(2πe) + 0.5 * log(Sigma_tt)
+        L1 = half_log_2pie + 0.5 * np.log(diag_var)                   # (n, T)
 
-        try:
-            chol = np.linalg.cholesky(Sigma)                                  # batched
-        except np.linalg.LinAlgError:
-            # Rank-deficient matrices (e.g. M < T) or borderline-PD ones break
-            # batched Cholesky on a single bad row. Fall back to per-row with
-            # adaptive jitter — the loop is slower but only triggered when needed.
-            chol = np.empty_like(Sigma)
-            for i in range(n):
-                S = Sigma[i]
-                jitter = max(self._ridge, 1e-8)
-                for _ in range(20):
-                    try:
-                        chol[i] = np.linalg.cholesky(S)
-                        break
-                    except np.linalg.LinAlgError:
-                        S = S + jitter * np.eye(T)
-                        jitter *= 10
-                else:
-                    raise np.linalg.LinAlgError(
-                        f"MVNSampleImputer: row {i} not PD even at jitter={jitter:.1e}")
-        diag_L = np.diagonal(chol, axis1=-2, axis2=-1)                        # (n, T)
+        # Level 2: Sequential conditional entropies
+        # H(Y_t | Y_<t) = 0.5 * log(2πe) + log(L_tt)
+        # L_tt² is the conditional variance σ²_{t|<t} (Schur complement)
+        L2 = half_log_2pie + log_diag_L                               # (n, T)
 
-        L1 = half_log_2pie + 0.5 * np.log(diag_var)
-        L2 = half_log_2pie + np.log(diag_L)
-        L3 = L2.sum(axis=-1)
+        # Level 3: Joint entropy
+        # H(Y_1:T) = T/2 * log(2πe) + 0.5 * log(det(Sigma))
+        #          = T/2 * log(2πe) + sum_t log(L_tt)
+        L3 = T * half_log_2pie + np.sum(log_diag_L, axis=-1)          # (n,)
+
         return L1, L2, L3
 
 
 # =============================================================================
-#   Mixture Copula Imputer
-#   Used in Section 5.3.2 to isolate the copula approximation error: same 
-#   pipeline as KDECopulaImputer but with analytical mixture marginals from 
-#   raw distribution parameters.
+#               Gaussian Copula with KDE Marginals (GC-KDE)
+#
+# Fits KDE marginals and a Gaussian copula to predictive samples and
+# estimates marginal, conditional, and joint entropies using KDE-based
+# marginal estimates and analytical Gaussian copula corrections.
 # =============================================================================
 
-class MixtureCopulaImputer(SampleImputer):
-    """Analytical mixture marginals + Gaussian copula on PIT-transformed samples.
+class KDECopulaImputer(SampleImputer):
+    """GC-KDE (Sec. 4.2.3, App. C.3): KDE marginals and a Gaussian copula.
 
-    Requires `raw` distribution parameters from the predict_fn — only models
-    that expose per-step parameters (e.g. DeepAR) can drive this estimator.
+    Approximates the marginals using KDE and the dependence structure using
+    a Gaussian copula fitted to PIT-transformed samples::
+
+        Level 1:  H^(Y_t | x~)        = -1/N sum_i log f^_{t,-i}(y_t^(i))      (Eq. C.9)
+        Level 2:  H^(Y_t | Y_<t, x~)  = H^(Y_t | x~) + 1/2 log σ^2_{t|<t,z}   (Eq. C.10)
+        Level 3:  H^(Y | x~)          = sum_t H^(Y_t | x~) + 1/2 log det R^
+
+    with R^ the correlation matrix of z_t = Φ^{-1}(F^_t(y_t)) and σ^2_{t|<t,z}
+    its Schur complement (L_tt² of the Cholesky factor).
 
     Parameters
     ----------
-    distribution : str
-        'normal', 'studentt', or 'lognormal'. Determines how raw parameters
-        are mapped to the per-step log-density for the marginal mixture.
-    shrinkage : float
-        Optional shrinkage toward the identity for the correlation matrix.
-        Default 0.0 — instead, ill-conditioned matrices are stabilised via
-        eigenvalue clipping in `_project_to_correlation_matrix`, which avoids
-        the constant off-diagonal bias of fixed shrinkage.
+    cdf_eps : float
+        Clipping threshold for PIT values to avoid infinite Gaussian quantiles.
+    """
+
+    def __init__(self, *args, cdf_eps: float = 1e-6, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        if not 0 < cdf_eps < 0.5:
+            raise ValueError("cdf_eps must be between 0 and 0.5.")
+
+        self._cdf_eps = cdf_eps
+
+    def _estimate_one(self, samples_i: np.ndarray):
+        """Estimate entropies for a single sample distribution (M, T)."""
+        samples_i = np.asarray(samples_i, dtype=float)
+        M, T = samples_i.shape
+
+        if not np.all(np.isfinite(samples_i)):
+            raise ValueError("Samples must contain only finite values.")
+
+        if M <= T:
+            raise ValueError(
+                f"Need M > T for full-rank copula correlation, got M={M}, T={T}."
+            )
+
+        L1 = np.empty(T)
+        u = np.empty((M, T), dtype=float)
+
+        # Estimate marginal KDEs, entropies, and PIT values
+        for t in range(T):
+            kde = GaussianKDE1D(samples_i[:, t])
+
+            # Level 1: Marginal entropies (KDE leave-one-out estimator)
+            # H(Y_t) = -E[log(f_t(Y_t))]
+            L1[t] = kde.entropy_loo()
+
+            # Probability integral transform: U_t = F_t(Y_t)
+            u[:, t] = np.clip(
+                kde.cdf(samples_i[:, t]),
+                self._cdf_eps, 1 - self._cdf_eps
+            )
+
+        # Univariate case: All three levels coincide
+        if T == 1:
+            return L1, L1.copy(), float(L1[0]), False
+
+        # Estimate Gaussian copula correlation matrix
+        z = norm.ppf(u)                       # Gaussian scores: Z_t = Phi^-1(U_t)
+        R = np.corrcoef(z, rowvar=False)      # (T, T)
+
+        if not np.all(np.isfinite(R)):
+            raise ValueError("Non-finite copula correlation matrix.")
+
+        # Ensure positive definiteness via eigenvalue clipping if needed
+        projected = np.linalg.eigvalsh(R)[0] < 1e-8
+        if projected:
+            R = _project_to_correlation_matrix(R, min_eig=1e-8)
+
+        # Cholesky decomposition: R = L @ L.T
+        chol = np.linalg.cholesky(R)
+        log_diag_L = np.log(np.diag(chol))
+
+        # Level 2: Sequential conditional entropies
+        # H(Y_t | Y_<t) = H(Y_t) + log(L_tt)
+        L2 = L1 + log_diag_L  # (T,)
+
+        # Level 3: Joint entropy
+        # H(Y_1:T) = sum_t H(Y_t) + 0.5 * log(det(R))
+        sign, logdet_R = np.linalg.slogdet(R)
+        if sign <= 0:
+            raise ValueError("Copula correlation matrix is not positive definite.")
+        L3 = float(L1.sum() + 0.5 * logdet_R)
+
+        return L1, L2, L3, projected
+
+    def _compute_all(self, dist):
+        # Samples: n instance/coalition combinations, M samples, T outputs
+        samples = dist[0] if isinstance(dist, tuple) else dist
+        n, M, T = samples.shape
+
+        # Allocate entropy arrays for all distributions
+        L1 = np.empty((n, T))
+        L2 = np.empty((n, T))
+        L3 = np.empty(n)
+
+        # Estimate entropies separately for each distribution
+        n_projected = 0
+        for i in range(n):
+            L1[i], L2[i], L3[i], projected = self._estimate_one(samples[i])
+            n_projected += int(projected)
+
+        # Report numerical stabilization, if applied
+        if n_projected:
+            warnings.warn(
+                f"KDECopulaImputer: projected {n_projected}/{n} "
+                "copula correlation matrices.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        return L1, L2, L3
+
+
+# =============================================================================
+#                          kNN Entropy Estimator
+#
+# Estimates marginal and joint entropies from predictive samples using the
+# Kozachenko-Leonenko kNN estimator. Conditional entropies are obtained
+# through differences of joint entropy estimates.
+# =============================================================================
+
+class KNNImputer(SampleImputer):
+    """kNN (Sec. 4.2.3): nonparametric entropies from multivariate predictive samples.
+
+    Uses the Kozachenko-Leonenko kNN estimator for marginal and joint
+    entropies. Sequential conditional entropies are estimated via the
+    entropy chain rule.
+
+    Unlike MVNSampleImputer and KDECopulaImputer, no parametric assumptions
+    are imposed on the marginals or dependence structure. However, the
+    kNN estimator assumes continuous data and can be noisy in high dimensions.
+
+    Parameters
+    ----------
+    k : int
+        Number of nearest neighbors used for entropy estimation.
+    skip_l1 : bool
+        Skip marginal entropy estimation (except implicitly for Y_1).
+        Returns NaN for all Level 1 values when True (App. D.3.3 needs only
+        Levels 2 and 3 from kNN).
+    """
+
+    def __init__(self, *args, k: int = 5, skip_l1: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        if k < 1:
+            raise ValueError("k must be a positive integer.")
+
+        self._k = k
+        self._skip_l1 = skip_l1
+
+    def _compute_all(self, dist):
+        # Samples: n instance/coalition combinations, M predictive samples, T output dimensions
+        samples = dist[0] if isinstance(dist, tuple) else dist  # (n, M, T)
+        n, M, T = samples.shape
+
+        if M <= self._k:
+            raise ValueError(f"Need M > k, got M={M}, k={self._k}.")
+
+        # Allocate entropy arrays for all distributions
+        L1 = np.full((n, T), np.nan) if self._skip_l1 else np.empty((n, T))
+        L2 = np.empty((n, T))
+        L3 = np.empty(n)
+
+        # Estimate entropies separately for each distribution
+        for i in range(n):
+            y = samples[i]  # (M, T)
+
+            # Estimate joint prefix entropies H(Y_1:t), t = 1, ..., T
+            # H(Y_1:t) = psi(M) - psi(k) + log(V_t) + t * mean(log(rho_k))
+            joint_prefix = np.array([
+                _knn_entropy(y[:, :t], k=self._k)
+                for t in range(1, T + 1)
+            ])  # (T,)
+
+            # Level 1: Marginal entropies
+            # H(Y_t) estimated using univariate kNN
+            if not self._skip_l1:
+                L1[i, 0] = joint_prefix[0]
+                for t in range(1, T):
+                    L1[i, t] = _knn_entropy(y[:, t:t + 1], k=self._k)
+
+            # Level 2: Sequential conditional entropies (chain rule)
+            # H(Y_t | Y_<t) = H(Y_1:t) - H(Y_1:t-1)
+            L2[i, 0] = joint_prefix[0]
+            L2[i, 1:] = np.diff(joint_prefix)
+
+            # Level 3: Joint entropy
+            # H(Y_1:T) estimated directly using multivariate kNN
+            L3[i] = joint_prefix[-1]
+
+        return L1, L2, L3
+
+
+# =============================================================================
+#          Gaussian Copula with Model-Based Marginals (GC-Param)
+#
+# Estimates marginal entropies using mixtures of model-based predictive
+# distributions and combines them with a fitted Gaussian copula.
+# =============================================================================
+
+class MixtureCopulaImputer(SampleImputer):
+    """GC-Param (App. D.3.3): Gaussian copula with model-based mixture marginals.
+
+    Approximates the marginal predictive distributions using mixtures of
+    conditional distributions obtained from model parameters. Marginal
+    entropies are estimated via Monte Carlo, while dependence is approximated
+    using a Gaussian copula. Compared with GC-KDE, this isolates the copula
+    part of the estimation error.
+
+    Requires raw distribution parameters from the prediction model.
     """
 
     def __init__(self, *args, distribution: str = "normal",
-                 shrinkage: float = 0.0, cdf_eps: float = 1e-6, **kwargs):
+                 cdf_eps: float = 1e-6, **kwargs):
         super().__init__(*args, **kwargs)
         if distribution not in {"normal", "studentt", "lognormal"}:
             raise ValueError(f"unknown distribution: {distribution}")
+        if not 0 < cdf_eps < 0.5:
+            raise ValueError("cdf_eps must be between 0 and 0.5.")
+
         self._distribution = distribution
-        self._shrinkage = shrinkage
         self._cdf_eps = cdf_eps
         # n_params per step depends on distribution
         self._n_params = 3 if distribution == "studentt" else 2
 
-    # ── Analytical mixture marginal entropies ────────────────────────────────
-
-    def _mixture_marginal_entropy(self, samples_i: np.ndarray,
-                                    raw_i: np.ndarray) -> np.ndarray:
-        """H(Y_t) as mixture over M trajectories via logsumexp.
-
-        samples_i : (M, T)
-        raw_i     : (M, T, n_params)
-        returns   : (T,)
-
-        For each (y, θ) pair we evaluate the per-step log-density via
-        ``scipy.stats.{norm,lognorm,t}.logpdf``, average over the M trajectory
-        components in log-space (``logsumexp − log M``), and report
-        ``H(Y_t) = −mean_y log p_mix(y)``.
-        """
+    def _mixture_marginals(self, samples_i: np.ndarray,
+                           raw_i: np.ndarray):
+        """Estimate marginal entropies and PIT values from mixture distributions."""
         M, T = samples_i.shape
-        y = samples_i[:, None, :]                                            # (M_y, 1, T)
+
+        if raw_i.shape != (M, T, self._n_params):
+            raise ValueError("Invalid shape of raw distribution parameters.")
+
+        # Broadcast samples against all mixture components
+        y = samples_i[:, None, :]  # (M_y, 1, T)
 
         if self._distribution == "normal":
-            mu    = raw_i[..., 0][None, :, :]                                # (1, M_s, T)
-            sigma = np.log1p(np.exp(raw_i[..., 1]))[None, :, :]              # softplus
+            mu = raw_i[..., 0][None, :, :]
+            sigma = np.logaddexp(0.0, raw_i[..., 1])[None, :, :]
+
             log_comps = norm.logpdf(y, loc=mu, scale=sigma)
+            cdf_comps = norm.cdf(y, loc=mu, scale=sigma)
 
         elif self._distribution == "lognormal":
-            mu    = raw_i[..., 0][None, :, :]
-            # LogNormalDistributionLoss uses sigmoid(raw) + 1e-3 for sigma
-            # (see entropy_shapley/losses.py). scipy.stats.lognorm uses the
-            # (s = σ, scale = exp(μ)) parameterisation.
+            if np.any(y <= 0):
+                raise ValueError("Lognormal samples must be positive.")
+
+            mu = raw_i[..., 0][None, :, :]
             sigma = (expit(raw_i[..., 1]) + 1e-3)[None, :, :]
-            log_comps = lognorm.logpdf(np.clip(y, 1e-6, None),
-                                       s=sigma, scale=np.exp(mu))
+            log_y = np.log(y)
+
+            # Lognormal PDF and CDF in log-space
+            log_comps = norm.logpdf(log_y, loc=mu, scale=sigma) - log_y
+            cdf_comps = norm.cdf(log_y, loc=mu, scale=sigma)
 
         else:  # studentt
-            df    = (np.log1p(np.exp(raw_i[..., 0])) + 2)[None, :, :]
-            mu    = raw_i[..., 1][None, :, :]
-            sigma = np.log1p(np.exp(raw_i[..., 2]))[None, :, :]
+            df = (np.logaddexp(0.0, raw_i[..., 0]) + 2)[None, :, :]
+            mu = raw_i[..., 1][None, :, :]
+            sigma = np.logaddexp(0.0, raw_i[..., 2])[None, :, :]
+
             log_comps = student_t.logpdf(y, df=df, loc=mu, scale=sigma)
+            cdf_comps = student_t.cdf(y, df=df, loc=mu, scale=sigma)
 
-        log_p = logsumexp(log_comps, axis=1) - np.log(M)
-        return -log_p.mean(axis=0)
+        # Level 1: Marginal entropies (Monte Carlo)
+        # H(Y_t) = -E[log(f_mix,t(Y_t))]
+        log_p = logsumexp(log_comps, axis=1) - np.log(M)  # (M, T)
 
-    # ── Dependence via Gauss copula on PIT-transformed samples ───────────────
+        if not np.all(np.isfinite(log_p)):
+            raise ValueError("Non-finite mixture log-densities.")
 
-    def _copula_log_L_diag(self, samples_i: np.ndarray) -> np.ndarray:
-        """log of Cholesky-diagonal of the Gauss-copula correlation R.
+        H_marg = -log_p.mean(axis=0)  # (T,)
 
-        returns (T,). Sum gives 0.5 * log det R (the copula entropy up to sign).
-        """
-        M, T = samples_i.shape
+        # Probability integral transform: U_t = F_mix,t(Y_t)
+        u = cdf_comps.mean(axis=1)
+        if not np.all(np.isfinite(u)):
+            raise ValueError("Non-finite mixture CDF values.")
+        u = np.clip(u, self._cdf_eps, 1 - self._cdf_eps)  # (M, T)
+
+        return H_marg, u
+
+    def _copula_terms(self, u: np.ndarray):
+        """Estimate Gaussian copula entropy terms from PIT values."""
+        M, T = u.shape
+
         if T == 1:
-            return np.zeros(1)
-        # Empirical rank-INT (rank-based inverse-normal transform)
-        ranks = np.argsort(np.argsort(samples_i, axis=0), axis=0) + 1
-        u = np.clip(ranks / (M + 1), self._cdf_eps, 1 - self._cdf_eps)
-        z = norm.ppf(u)
+            return np.zeros(1), 0.0, False
 
-        R = np.corrcoef(z, rowvar=False)
+        if M <= T:
+            raise ValueError(f"Need M > T, got M={M}, T={T}.")
+
+        # Estimate Gaussian copula correlation matrix
+        z = norm.ppf(u)                       # Z_t = Phi^-1(U_t)
+        R = np.corrcoef(z, rowvar=False)      # (T, T)
+
         if not np.all(np.isfinite(R)):
-            R = np.eye(T)
-        if self._shrinkage > 0:
-            R = (1 - self._shrinkage) * R + self._shrinkage * np.eye(T)
-        # Eigenvalue clipping handles rank-deficient / borderline-PSD cases
-        # without introducing a constant off-diagonal bias on the correlations.
-        R = _project_to_correlation_matrix(R)
-        L = np.linalg.cholesky(R)
-        return np.log(np.maximum(np.diag(L), 1e-12))
+            raise ValueError("Non-finite copula correlation matrix.")
+
+        # Ensure positive definiteness via eigenvalue clipping if needed
+        projected = np.linalg.eigvalsh(R)[0] < 1e-8
+        if projected:
+            R = _project_to_correlation_matrix(R, min_eig=1e-8)
+
+        # Cholesky decomposition: R = L @ L.T
+        chol = np.linalg.cholesky(R)
+        log_diag_L = np.log(np.diag(chol))
+
+        # Log-determinant: log(det(R)) = 2 * sum_t log(L_tt)
+        logdet_R = 2.0 * np.sum(log_diag_L)
+
+        return log_diag_L, float(logdet_R), projected
 
     def _compute_all(self, dist):
         if not isinstance(dist, tuple) or len(dist) != 2 or dist[1] is None:
             raise ValueError(
-                "MixtureCopulaImputer requires raw distribution parameters; "
-                "got samples only. Use KDECopulaImputer for sample-only inputs.")
-        samples, raw = dist                           # (n, M, T), (n, M, T, n_params)
-        n, M, T = samples.shape
-        L1 = np.empty((n, T))
-        L2 = np.empty((n, T))
-        L3 = np.empty(n)
-        for i in range(n):
-            H_marg = self._mixture_marginal_entropy(samples[i], raw[i])
-            log_L  = self._copula_log_L_diag(samples[i])
-            L1[i] = H_marg
-            L2[i] = H_marg + log_L
-            L3[i] = L2[i].sum()
-        return L1, L2, L3
-
-
-# =============================================================================
-#  Section 4.2.3 — "Semiparametric Gaussian copula" (Algorithm in Appendix D).
-#  Main paper estimator. Fully model-agnostic: KDE marginals + Gauss copula.
-# =============================================================================
-
-class KDECopulaImputer(SampleImputer):
-    """KDE marginals + Gaussian copula on PIT-transformed samples.
-
-    Implements the algorithm from Appendix D, steps 1–6, applied to a
-    pre-existing trajectory bag. Used in Section 5.3.3 on NeuralForecast
-    models without a distribution head. Validated in 5.3.2 on DeepAR.
-
-    Parameters
-    ----------
-    shrinkage : float
-        Optional shrinkage toward the identity for the correlation matrix.
-        Default 0.0 — instead, ill-conditioned matrices are stabilised via
-        eigenvalue clipping in `_project_to_correlation_matrix`, which avoids
-        the constant off-diagonal bias of fixed shrinkage.
-    marginal_lower_bound : float | None
-        For bounded-support marginals (e.g. LogNormal), pass 0.0.
-    marginal_transform : {'none', 'log'}
-        'log' recommended for heavily skewed positive-support marginals.
-    """
-
-    def __init__(self, *args,
-                 shrinkage: float = 0.0,
-                 cdf_eps: float = 1e-6,
-                 marginal_lower_bound: float | None = None,
-                 marginal_transform: str = "none",
-                 marginal_transform_eps: float = 1e-9,
-                 **kwargs):
-        super().__init__(*args, **kwargs)
-        self._shrinkage = shrinkage
-        self._cdf_eps = cdf_eps
-        self._lower_bound = marginal_lower_bound
-        self._transform = marginal_transform
-        self._transform_eps = marginal_transform_eps
-
-    def _estimate_one(self, samples_i: np.ndarray):
-        """samples_i: (M, T) -> (L1, L2, L3)."""
-        M, T = samples_i.shape
-        L1 = np.empty(T)
-        u = np.empty_like(samples_i)
-
-        for t in range(T):
-            kde = GaussianKDE1D(
-                samples_i[:, t],
-                lower_bound=self._lower_bound,
-                transform=self._transform,
-                transform_eps=self._transform_eps,
+                "MixtureCopulaImputer requires raw distribution parameters."
             )
-            L1[t] = kde.entropy_loo()
-            u[:, t] = np.clip(kde.cdf(samples_i[:, t]), self._cdf_eps, 1 - self._cdf_eps)
 
-        if T == 1:
-            return L1, L1.copy(), float(L1[0])
+        # Samples: n instance/coalition combinations, M samples, T outputs
+        samples, raw = dist  # (n, M, T), (n, M, T, n_params)
+        n, M, T = samples.shape
 
-        z = norm.ppf(u)
-        R = np.corrcoef(z, rowvar=False)
-        if not np.all(np.isfinite(R)):
-            R = np.eye(T)
-        if self._shrinkage > 0:
-            R = (1 - self._shrinkage) * R + self._shrinkage * np.eye(T)
-        # Eigenvalue clipping handles rank-deficient / borderline-PSD cases
-        # without introducing a constant off-diagonal bias on the correlations.
-        R = _project_to_correlation_matrix(R)
-        chol = np.linalg.cholesky(R)
-        log_L_diag = np.log(np.maximum(np.diag(chol), 1e-12))
+        if M < 2:
+            raise ValueError("Need at least two predictive samples.")
+        if not np.all(np.isfinite(samples)) or not np.all(np.isfinite(raw)):
+            raise ValueError("Samples and raw parameters must be finite.")
 
-        L2 = L1 + log_L_diag
-        return L1, L2, float(L2.sum())
-
-    def _compute_all(self, dist):
-        samples = dist[0] if isinstance(dist, tuple) else dist  # ignore raw
-        n = samples.shape[0]
-        T = samples.shape[-1]
+        # Allocate entropy arrays for all distributions
         L1 = np.empty((n, T))
         L2 = np.empty((n, T))
         L3 = np.empty(n)
+
+        # Estimate entropies separately for each distribution
+        n_projected = 0
         for i in range(n):
-            L1[i], L2[i], L3[i] = self._estimate_one(samples[i])
+            H_marg, u = self._mixture_marginals(samples[i], raw[i])
+            log_diag_L, logdet_R, projected = self._copula_terms(u)
+            n_projected += int(projected)
+
+            # Level 1: Marginal entropies
+            # H(Y_t) = -E[log(f_mix,t(Y_t))]
+            L1[i] = H_marg
+
+            # Level 2: Sequential conditional entropies
+            # H(Y_t | Y_<t) = H(Y_t) + log(L_tt)
+            L2[i] = H_marg + log_diag_L
+
+            # Level 3: Joint entropy
+            # H(Y_1:T) = sum_t H(Y_t) + 0.5 * log(det(R))
+            L3[i] = H_marg.sum() + 0.5 * logdet_R
+
+        # Report numerical stabilization, if applied
+        if n_projected:
+            warnings.warn(
+                f"MixtureCopulaImputer: projected {n_projected}/{n} "
+                "copula correlation matrices.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
         return L1, L2, L3
 
 
 # =============================================================================
-#       Section 4.2.3 — "Nonparametric kNN estimation" (Kozachenko-Leonenko)
+#                 Gaussian KDE with Leave-One-Out Entropy
 # =============================================================================
 
-class KNNImputer(SampleImputer):
-    """Nonparametric Kozachenko-Leonenko kNN estimator.
+# Pairwise kernel terms are evaluated in row blocks of about this many elements
+# (1 MB in float64). Full M x M arrays (32 MB at M = 2000) made the KDE limited
+# by memory bandwidth once several processes ran in parallel.
+_KDE_BLOCK_ELEMENTS = 1 << 17
 
-    L1: univariate KL on each horizon column.
-    L3: multivariate KL on the full (M, T) sample matrix.
-    L2: chain-rule difference L3_{1:t} - L3_{1:t-1}.
 
-    The difference-based L2 is noisy for large t — this is expected behavior
-    and part of the validation narrative (curse of dimensionality of kNN in
-    multivariate settings).
+def _row_blocks(n_rows: int, n_columns: int) -> list[slice]:
+    """Split the rows of an (n_rows, n_columns) pairwise array into blocks."""
+    step = max(1, _KDE_BLOCK_ELEMENTS // max(n_columns, 1))
+    return [slice(start, min(start + step, n_rows)) for start in range(0, n_rows, step)]
+
+
+class GaussianKDE1D:
+    """Univariate Gaussian KDE with leave-one-out entropy and CDF (GC-KDE marginals, App. C.3).
+
+    The bandwidth is the kernel SD of scipy.stats.gaussian_kde with Silverman's
+    rule of thumb.
     """
 
-    def __init__(self, *args, k: int = 5, jitter: float = 1e-12,
-                 skip_l1: bool = False, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._k = k
-        self._jitter = jitter
-        # L1 = T independent univariate kNN trees per row. The DeepAR validation
-        # pipeline (Section 5.3.2) only aggregates L2/L3, so this is dead work
-        # there. Set skip_l1=True to fill L1 with NaN and save ~30-40% per row.
-        self._skip_l1 = skip_l1
+    def __init__(self, samples: np.ndarray) -> None:
+        self.samples = np.asarray(samples, dtype=float).ravel()
+        if self.samples.size < 2:
+            raise ValueError("need at least 2 samples for KDE")
+        if not np.all(np.isfinite(self.samples)):
+            raise ValueError("Samples must contain only finite values.")
+        self.n = self.samples.size
 
-    def _compute_all(self, dist):
-        samples = dist[0] if isinstance(dist, tuple) else dist  # (n, M, T)
-        n, M, T = samples.shape
-        L1 = (np.full((n, T), np.nan) if self._skip_l1 else np.empty((n, T)))
-        L2 = np.empty((n, T))
-        L3 = np.empty(n)
+        # scipy's kernel covariance is factor^2 times the sample variance (ddof=1).
+        std = float(np.std(self.samples, ddof=1)) or 1.0
+        self.bandwidth = float(gaussian_kde(self.samples, bw_method="silverman").factor * std)
 
-        for i in range(n):
-            y = samples[i]  # (M, T)
-            if not self._skip_l1:
-                L1[i] = np.array([
-                    _knn_entropy(y[:, t:t + 1], k=self._k, jitter=self._jitter)
-                    for t in range(T)
-                ])
-            # Joint prefix entropies H(Y_{1:t}) — needed for L2/L3 via chain rule
-            joint_prefix = np.array([
-                _knn_entropy(y[:, :t + 1], k=self._k, jitter=self._jitter)
-                for t in range(T)
-            ])
-            L2[i, 0] = joint_prefix[0]
-            if T > 1:
-                L2[i, 1:] = np.diff(joint_prefix)
-            L3[i] = joint_prefix[-1]
-        return L1, L2, L3
+    def cdf(self, x: np.ndarray) -> np.ndarray:
+        """F^(x) = mean_j Phi((x - y_j) / h), evaluated in row blocks."""
+        flat = np.asarray(x, dtype=float).ravel()
+        out = np.empty(flat.shape)
+        for rows in _row_blocks(flat.size, self.samples.size):
+            # ndtr is the standard normal CDF (what norm.cdf calls, without its overhead).
+            out[rows] = ndtr((flat[rows, None] - self.samples[None, :]) / self.bandwidth).mean(axis=1)
+        return np.clip(out.reshape(np.shape(x)), 0.0, 1.0)
+
+    def entropy_loo(self) -> float:
+        """Estimate entropy using leave-one-out Gaussian KDE densities (Eq. C.9).
+
+        H = -1/M * sum_i log(f_{-i}(y_i))
+
+        Each density excludes the kernel centered at y_i, while
+        keeping the bandwidth estimated from all samples fixed. The
+        pairwise kernels are evaluated in row blocks to save memory.
+        """
+        M = self.n
+        h = self.bandwidth
+        log_norm = np.log(h * np.sqrt(2 * np.pi))  # Gaussian kernel: -z^2/2 - log(h sqrt(2 pi))
+        log_dens = np.empty(M)
+        for rows in _row_blocks(M, M):
+            # Positions of the self-kernels (i, i) within this block of rows
+            own = (np.arange(rows.stop - rows.start), np.arange(rows.start, rows.stop))
+
+            # Pairwise Gaussian log-kernel densities, excluding self-contributions
+            z = (self.samples[rows, None] - self.samples[None, :]) / h
+            log_kern = -0.5 * z ** 2 - log_norm
+            log_kern[own] = -np.inf
+            log_dens[rows] = logsumexp(log_kern, axis=1)
+
+        # Normalize by the remaining M - 1 kernels
+        log_dens -= np.log(M - 1)
+
+        return float(-np.mean(log_dens))
 
 
 # =============================================================================
@@ -456,17 +631,35 @@ def evaluate_on_cached_samples(
     for purely sample-based estimators). Returns (L1, L2, L3) shaped (n, T),
     (n, T), (n,).
 
-    Used by Section 5.3: the same nested sample cache is fed through three
-    estimators (kNN, MVN, Gaussian copula) without ever generating samples again.
+    The experiments of Sec. 5.3 and App. D.3 feed the same trajectories through
+    all estimators this way, without generating samples again.
 
     n_jobs : int
-        If > 1, split the n rows into n_jobs equal chunks and run `_compute_all`
-        in parallel. Each estimator's per-row inner loop is pure Python with no
-        shared state, so this scales near-linearly on multi-core machines.
+        Number of parallel workers. If greater than 1, sample distributions
+        are split into chunks and processed independently using joblib.
     """
     if not issubclass(estimator_cls, SampleImputer):
         raise TypeError(
             f"{estimator_cls.__name__} must be a SampleImputer subclass")
+
+    # Validate sample dimensions and parallelization settings
+    if samples.ndim != 3:
+        raise ValueError("Samples must have shape (n, M, T).")
+
+    n, M, T_samples = samples.shape
+
+    if T != T_samples:
+        raise ValueError(f"Expected T={T}, got T={T_samples}.")
+
+    if raw is not None and (raw.ndim != 4 or raw.shape[:3] != samples.shape):
+        raise ValueError("Raw parameters must have shape (n, M, T, n_params).")
+
+    if n_jobs < 1:
+        raise ValueError("n_jobs must be a positive integer.")
+
+    # Return empty entropy arrays for empty sample batches
+    if n == 0:
+        return np.empty((0, T)), np.empty((0, T)), np.empty(0)
 
     p_dummy = 1
     def _make_est():
@@ -481,15 +674,14 @@ def evaluate_on_cached_samples(
     if n_jobs == 1:
         return _make_est()._compute_all((samples, raw))
 
-    # Split rows into n_jobs contiguous chunks. Slices are views (no copy);
-    # joblib's loky backend memmaps large numpy args automatically.
-    n = samples.shape[0]
-    bounds = np.linspace(0, n, n_jobs + 1, dtype=int)
+    # Split samples into at most n non-empty chunks
+    n_chunks = min(n_jobs, n)
+    bounds = np.linspace(0, n, n_chunks + 1, dtype=int)
 
     def _run_chunk(s_chunk, r_chunk):
         return _make_est()._compute_all((s_chunk, r_chunk))
 
-    results = Parallel(n_jobs=n_jobs, backend=backend)(
+    results = Parallel(n_jobs=n_chunks, backend=backend)(
         delayed(_run_chunk)(
             samples[s:e],
             raw[s:e] if raw is not None else None,
@@ -502,143 +694,6 @@ def evaluate_on_cached_samples(
     L2 = np.concatenate([r[1] for r in results], axis=0)
     L3 = np.concatenate([r[2] for r in results], axis=0)
     return L1, L2, L3
-
-
-# =============================================================================
-#                      Gaussian KDE with leave-one-out entropy
-# =============================================================================
-
-class GaussianKDE1D:
-    """1D Gaussian-kernel KDE with leave-one-out entropy and CDF.
-
-    The base density is fitted via ``scipy.stats.gaussian_kde`` (Silverman's
-    rule of thumb); on top of that we layer (i) a leave-one-out plug-in
-    entropy estimator and (ii) optional boundary handling via reflection or a
-    log-transform with Jacobian correction (needed for lower-bounded supports
-    such as LogNormal marginals).
-    """
-
-    def __init__(
-        self,
-        samples: np.ndarray,
-        bandwidth: float | None = None,
-        lower_bound: float | None = None,
-        transform: str = "none",
-        transform_eps: float = 1e-9,
-    ) -> None:
-        self.samples = np.asarray(samples, dtype=float).ravel()
-        if self.samples.size < 2:
-            raise ValueError("need at least 2 samples for KDE")
-        self.n = self.samples.size
-        self.lower_bound = None if lower_bound is None else float(lower_bound)
-        self.transform = str(transform)
-        self.transform_eps = float(transform_eps)
-
-        if self.transform not in {"none", "log"}:
-            raise ValueError("transform must be 'none' or 'log'")
-        if self.transform == "log":
-            if self.lower_bound is None:
-                raise ValueError("lower_bound required when transform='log'")
-            shifted = self.samples - self.lower_bound + self.transform_eps
-            if np.any(shifted <= 0):
-                raise ValueError("samples must satisfy y > lower_bound - eps")
-            self._work = np.log(shifted)
-        else:
-            self._work = self.samples
-
-        # Bandwidth: scipy's Silverman rule of thumb by default; otherwise a
-        # caller-supplied scalar is passed through as `bw_method / std(data)`
-        # (scipy's internal convention).
-        std_work = float(np.std(self._work, ddof=1)) or 1.0
-        if bandwidth is None:
-            self._kde = gaussian_kde(self._work, bw_method="silverman")
-            self.bandwidth = float(self._kde.factor * std_work)
-        else:
-            self._kde = gaussian_kde(self._work, bw_method=float(bandwidth) / std_work)
-            self.bandwidth = float(bandwidth)
-        # (n, n) pairwise differences scaled by bandwidth — needed for LOO
-        self._pairwise = (self._work[:, None] - self._work[None, :]) / self.bandwidth
-
-    # ── Transform helpers ────────────────────────────────────────────────────
-
-    def _transform_x(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        x = np.asarray(x, dtype=float)
-        if self.transform == "none":
-            return x, np.ones_like(x, dtype=bool)
-        shifted = x - self.lower_bound + self.transform_eps
-        valid = shifted > 0
-        x_work = np.where(valid, np.log(np.where(valid, shifted, 1.0)), -np.inf)
-        return x_work, valid
-
-    def _jacobian_abs(self, x: np.ndarray) -> np.ndarray:
-        x = np.asarray(x, dtype=float)
-        if self.transform == "none":
-            return np.ones_like(x, dtype=float)
-        shifted = x - self.lower_bound + self.transform_eps
-        return np.where(shifted > 0, 1.0 / np.maximum(shifted, self.transform_eps), 0.0)
-
-    # ── Density and CDF ──────────────────────────────────────────────────────
-
-    def pdf(self, x: np.ndarray) -> np.ndarray:
-        x = np.asarray(x, dtype=float)
-        x_work, valid = self._transform_x(x)
-        # Base PDF in the working space via scipy.stats.gaussian_kde.
-        # Evaluate only finite entries (log-transform may produce -inf for
-        # invalid inputs), then reshape back to x_work.shape.
-        flat_work = x_work.ravel()
-        finite = np.isfinite(flat_work)
-        dens_flat = np.zeros_like(flat_work)
-        if finite.any():
-            dens_flat[finite] = self._kde.evaluate(flat_work[finite])
-        dens_work = dens_flat.reshape(x_work.shape)
-
-        if self.transform == "log":
-            return np.where(valid, dens_work * self._jacobian_abs(x), 0.0)
-
-        dens = dens_work
-        if self.lower_bound is not None:
-            # Reflection correction for positive-support marginals
-            mirror = 2.0 * self.lower_bound - self.samples
-            z_ref = (np.expand_dims(x, -1) - mirror) / self.bandwidth
-            dens = dens + norm.pdf(z_ref).mean(axis=-1) / self.bandwidth
-            dens = np.where(x < self.lower_bound, 0.0, dens)
-        return dens
-
-    def cdf(self, x: np.ndarray) -> np.ndarray:
-        x = np.asarray(x, dtype=float)
-        x_work, valid = self._transform_x(x)
-        z = (np.expand_dims(x_work, -1) - self._work) / self.bandwidth
-        cdf = norm.cdf(z).mean(axis=-1)
-
-        if self.transform == "log":
-            return np.clip(np.where(valid, cdf, 0.0), 0.0, 1.0)
-
-        if self.lower_bound is not None:
-            z_ref = (np.expand_dims(x, -1) + self.samples - 2.0 * self.lower_bound) / self.bandwidth
-            cdf = cdf + norm.cdf(z_ref).mean(axis=-1) - 1.0
-            cdf = np.where(x < self.lower_bound, 0.0, cdf)
-        return np.clip(cdf, 0.0, 1.0)
-
-    def entropy_loo(self, jitter: float = 1e-12) -> float:
-        """Leave-one-out plug-in entropy estimate: H = -mean log p̂_{-i}(y_i)."""
-        kern = norm.pdf(self._pairwise) / self.bandwidth
-        np.fill_diagonal(kern, 0.0)
-        dens = kern.sum(axis=1)
-
-        if self.transform == "log":
-            dens = dens / max(self.n - 1, 1)
-            dens = dens * self._jacobian_abs(self.samples)
-            return float(-np.mean(np.log(np.maximum(dens, jitter))))
-
-        if self.lower_bound is not None:
-            mirror = (self.samples[:, None] + self.samples[None, :] - 2.0 * self.lower_bound) / self.bandwidth
-            kern_ref = norm.pdf(mirror) / self.bandwidth
-            np.fill_diagonal(kern_ref, 0.0)
-            dens = dens + kern_ref.sum(axis=1)
-
-        dens = dens / max(self.n - 1, 1)
-        return float(-np.mean(np.log(np.maximum(dens, jitter))))
-
 
 
 # =============================================================================
@@ -663,29 +718,43 @@ def _log_unit_ball_volume(dim: int) -> float:
     return 0.5 * dim * np.log(np.pi) - gammaln(0.5 * dim + 1.0)
 
 
-def _knn_entropy(samples: np.ndarray, k: int = 5, jitter: float = 1e-12) -> float:
+def _knn_entropy(samples: np.ndarray, k: int = 5) -> float:
     """Kozachenko-Leonenko kNN differential entropy estimator.
 
-    H = psi(n) - psi(k) + log(V_d) + d * mean(log rho_i)
+    H = psi(M) - psi(k) + log(V_d) + d * mean(log(rho_k))
 
-    where rho_i is the Euclidean distance to the k-th nearest neighbor
-    (self excluded) and V_d is the volume of the d-dimensional unit ball.
-
+    rho_k is the Euclidean distance to the k-th nearest neighbor
+    (excluding the sample itself).
     Follows the radius-convention consistent with Wikipedia and the original
     Kozachenko-Leonenko (1987) paper. See https://infomeasure.readthedocs.io/en/0.5.0/guide/entropy/kozachenko_leonenko/
-    for details.
     """
-    x = np.atleast_2d(samples).astype(float)
+    x = np.asarray(samples, dtype=float)
+
+    # Ensure shape (M, d)
     if x.ndim == 1:
         x = x[:, None]
-    n, dim = x.shape
-    if n <= k:
-        raise ValueError(f"need n > k (got n={n}, k={k})")
+    elif x.ndim != 2:
+        raise ValueError("Samples must have shape (M,) or (M, d).")
 
-    tree = cKDTree(x)
+    M, d = x.shape
+
+    if not 1 <= k < M:
+        raise ValueError(f"Need 1 <= k < M, got k={k}, M={M}.")
+
+    if not np.all(np.isfinite(x)):
+        raise ValueError("Samples must contain only finite values.")
+
+    # Euclidean distance to the k-th nearest neighbor
+    tree = KDTree(x)
     distances, _ = tree.query(x, k=k + 1, p=2)
-    rho = np.maximum(distances[:, -1], jitter)
+    rho = distances[:, -1]
 
+    if np.any(rho <= 0) or not np.all(np.isfinite(rho)):
+        raise ValueError("Zero or non-finite kNN distances encountered.")
+
+    # Kozachenko-Leonenko entropy estimate
     return float(
-        digamma(n) - digamma(k) + _log_unit_ball_volume(dim) + dim * np.mean(np.log(rho))
+        digamma(M) - digamma(k)
+        + _log_unit_ball_volume(d)
+        + d * np.mean(np.log(rho))
     )

@@ -1,0 +1,14 @@
+\begin{tabular}{llrrrrrrr}
+\toprule
+Model & Estimator & Share (\%) & IQR & Alt.\ (\%) & Diff.\ to ref.\ (pp) & Mean abs.\ diff.\ (pp) & Corr. & $>$ gap (\%) \\
+\midrule
+deepar & analytical & 25.2 & [21.1,\,30.4] & 28.5 & -- & -- & -- & -- \\
+chronos_base & analytical & 42.4 & [33.4,\,54.0] & 65.8 & -- & -- & -- & -- \\
+deepar & mvn & 22.9 & [18.3,\,27.8] & 25.7 & -2.5 & 2.7 & 0.98 & 0 \\
+deepar & kde & 21.9 & [17.6,\,27.2] & 25.1 & -3.2 & 3.4 & 0.98 & 0 \\
+deepar & knn & 19.9 & [15.0,\,28.0] & 21.3 & -5.7 & 6.6 & 0.81 & 1 \\
+chronos_base & mvn & 50.9 & [36.7,\,61.9] & 65.0 & 9.5 & 15.3 & 0.46 & 40 \\
+chronos_base & kde & 45.4 & [35.7,\,56.9] & 58.2 & 4.5 & 12.2 & 0.54 & 24 \\
+chronos_base & knn & 36.3 & [28.3,\,50.1] & 50.0 & -6.7 & 14.7 & 0.28 & 29 \\
+\bottomrule
+\end{tabular}
